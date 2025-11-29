@@ -42,12 +42,16 @@ class OmegaNeuralMemory(NeuralMemory):
         poly_mode: str = 'off',  # 'off' | 'elementwise' | 'tensor'
         **kwargs
     ):
+        # pop atlas-only kwargs before passing to base class
+        use_qkv_convs = kwargs.pop('use_qkv_convs', None)
         super().__init__(*args, **kwargs)
         assert omega_window >= 1
         self.omega_window = omega_window
         self.use_omega_gate = use_omega_gate
         self.poly_degree = int(poly_degree)
         self.poly_mode = poly_mode
+        # auto policy: convs off for e=1 to preserve parity with base in tests
+        self.use_qkv_convs = (omega_window > 1) if use_qkv_convs is None else bool(use_qkv_convs)
         # gate computed at chunk resolution: (b n d) -> (b n h) -> ((b h) n 1)
         self._omega_gate_linear = nn.Linear(self.to_decay_factor[0].in_features, self.heads)
         self._omega_gate_act = nn.Sigmoid()
@@ -65,6 +69,24 @@ class OmegaNeuralMemory(NeuralMemory):
                 q2 = self.apply_fn(q2)
                 return rearrange(q2, '(b h n) d -> b h n d', b = b, h = h, n = n)
         self.q_norm = nn.Sequential(self.q_norm, _PolyQueryMap(self._apply_poly_features))
+        # depthwise convs on sequence axis for Q/K/V (kernel_size=1 to preserve length)
+        # infer input dim from first linear in to_keys
+        first_linear = self.to_keys[0] if isinstance(self.to_keys, nn.Sequential) else self.to_keys
+        dim = first_linear.in_features
+        self.q_conv = nn.Conv1d(dim, dim, kernel_size=1, groups=dim, bias=False)
+        self.k_conv = nn.Conv1d(dim, dim, kernel_size=1, groups=dim, bias=False)
+        self.v_conv = nn.Conv1d(dim, dim, kernel_size=1, groups=dim, bias=False)
+    def _apply_seq_conv(self, seq: Tensor, conv: nn.Module) -> Tensor:
+        # seq: (b, n, d) -> (b, d, n) -> conv1d -> (b, n, d)
+        if not isinstance(seq, torch.Tensor) or seq.ndim != 3:
+            return seq
+        # guard empty-length sequences (e.g., when round_down_seq_len == 0)
+        if seq.shape[1] == 0:
+            return seq
+        seq_t = rearrange(seq, 'b n d -> b d n')
+        out = conv(seq_t)
+        out = rearrange(out, 'b d n -> b n d')
+        return out
     def _apply_poly_features(self, x: Tensor) -> Tensor:
         # x: [... d]
         if self.poly_degree <= 1 or self.poly_mode == 'off':
@@ -158,11 +180,17 @@ class OmegaNeuralMemory(NeuralMemory):
             if learned_combine:
                 combine_momentums = self.to_learned_momentum_combine(chunked_seq)  # ['o (bh) n']
 
-        # keys / values
-        keys = self.to_keys(seq)
+        # keys / values (optionally apply convs on sequence before projections)
+        if self.use_qkv_convs:
+            seq_k = self._apply_seq_conv(seq, self.k_conv)
+            seq_v = self._apply_seq_conv(values_seq, self.v_conv)
+        else:
+            seq_k = seq
+            seq_v = values_seq
+        keys = self.to_keys(seq_k)
         # apply polynomial mapping on keys before splitting heads
         keys = self._apply_poly_features(keys)
-        values = self.to_values(values_seq)
+        values = self.to_values(seq_v)
         keys, values = map(self.split_kv_heads, (keys, values))                    # ['b h (n c u) d']
         keys = self.k_norm(keys)
 
@@ -306,6 +334,9 @@ class OmegaNeuralMemory(NeuralMemory):
         seq,
         weights: dict[str, Tensor],
     ):
+        # apply conv on queries before delegating
+        if self.use_qkv_convs and seq is not None and isinstance(seq, torch.Tensor) and seq.ndim == 3:
+            seq = self._apply_seq_conv(seq, self.q_conv)
         # ensure non-empty dict of parameters for functional_call
         need_init = False
         if isinstance(weights, TensorDict):

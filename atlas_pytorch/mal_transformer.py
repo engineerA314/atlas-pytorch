@@ -284,10 +284,11 @@ class MemoryAsLayerTransformer(Module):
                 heads = heads,
             )
             
-            # feedforward
-            ff = FeedForward(dim = dim, mult = ff_mult)
+            # feedforwards: one after memory (pre-attn), one after attention (post-attn)
+            ff_pre = FeedForward(dim = dim, mult = ff_mult)
+            ff_post = FeedForward(dim = dim, mult = ff_mult)
             
-            self.layers.append(ModuleList([mem, attn, ff]))
+            self.layers.append(ModuleList([mem, attn, ff_pre, ff_post]))
         
         self.norm = nn.RMSNorm(dim)
         self.to_logits = LinearNoBias(dim, num_tokens)
@@ -374,7 +375,7 @@ class MemoryAsLayerTransformer(Module):
         next_mem_states = []
         
         # process through layers
-        for layer_idx, (mem, attn, ff) in enumerate(self.layers):
+        for layer_idx, (mem, attn, ff_pre, ff_post) in enumerate(self.layers):
             attn_cache = attn_caches[layer_idx]
             mem_state = mem_states[layer_idx]
             
@@ -386,14 +387,17 @@ class MemoryAsLayerTransformer(Module):
             else:
                 next_mem_states.append(None)
             
+            # pre-attention feedforward
+            x = x + ff_pre(x)
+            
             # then sliding window attention
             attn_out, next_attn_cache = attn(x, cache = attn_cache)
             next_attn_caches.append(next_attn_cache)
             
             x = x + attn_out
             
-            # feedforward
-            x = x + ff(x)
+            # post-attention feedforward
+            x = x + ff_post(x)
         
         # final norm and logits
         x = self.norm(x)
