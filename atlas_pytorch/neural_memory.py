@@ -78,8 +78,12 @@ def xnor(x, y):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def is_empty_tensor(t):
+    return t.numel() == 0
+
 def safe_cat(inputs, dim = -2):
-    inputs = tuple(filter(exists, inputs))
+    # Filter out None and empty tensors
+    inputs = tuple(t for t in inputs if exists(t) and not is_empty_tensor(t))
 
     if len(inputs) == 0:
         return None
@@ -87,9 +91,6 @@ def safe_cat(inputs, dim = -2):
         return inputs[0]
 
     return cat(inputs, dim = dim)
-
-def is_empty_tensor(t):
-    return t.numel() == 0
 
 def dict_get_value_shapes(td):
     return [v.shape for k, v in td.items()]
@@ -1102,15 +1103,21 @@ class NeuralMemory(Module):
 
             # store
 
-            next_updates, next_neural_mem_state, chunk_surprises = self.store_memories(
+            store_result = self.store_memories(
                 store_seq_chunk,
                 weights,
                 seq_index = seq_index,
                 past_state = past_state,
                 prev_weights = prev_weights,
                 mask = maybe_store_mask,
-                return_surprises = True
+                return_surprises = return_surprises
             )
+
+            if return_surprises:
+                next_updates, next_neural_mem_state, chunk_surprises = store_result
+            else:
+                next_updates, next_neural_mem_state = store_result
+                chunk_surprises = (None, None)
 
             weights = next_neural_mem_state.weights
             seq_index = next_neural_mem_state.seq_index
@@ -1118,7 +1125,8 @@ class NeuralMemory(Module):
 
             updates = accum_updates(updates, next_updates)
 
-            surprises = tuple(safe_cat(args, dim = -1) for args in zip(surprises, chunk_surprises))
+            if return_surprises:
+                surprises = tuple(safe_cat(args, dim = -1) for args in zip(surprises, chunk_surprises))
 
             if is_last and not update_after_final_store:
                 continue

@@ -59,25 +59,8 @@ WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 # perf related
 
-USE_FLEX_ATTN = True
+USE_FLEX_ATTN = False  # will be overridden after argparse
 USE_FAST_INFERENCE = False
-
-# wandb experiment tracker (optional)
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-
-wandb_log = lambda data: None
-if args.wandb:
-    if WANDB_AVAILABLE:
-        wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
-        wandb.run.name = RUN_NAME
-        wandb.run.save()
-        wandb_log = wandb.log
-    else:
-        print("wandb not installed; skipping wandb logging.")
 
 # helpers
 
@@ -124,10 +107,29 @@ parser.add_argument('--dim-head', type=int, default=64)
 # wandb toggle
 parser.add_argument('--wandb', action='store_true', help='Enable wandb logging if installed')
 parser.add_argument('--use-accelerated-scan', action='store_true', help='Enable accelerated assoc_scan backend when available')
+parser.add_argument('--no-flex-attn', action='store_true', help='Disable flex attention (for environments without triton support)')
 args, _ = parser.parse_known_args()
+
+# wandb experiment tracker (optional)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
+wandb_log = lambda data: None
+if args.wandb:
+    if WANDB_AVAILABLE:
+        wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
+        wandb.run.name = RUN_NAME
+        wandb.run.save()
+        wandb_log = wandb.log
+    else:
+        print("wandb not installed; skipping wandb logging.")
 
 MODEL_TYPE = args.model
 OMEGA_WINDOW = args.omega_window
+USE_FLEX_ATTN = not args.no_flex_attn
 USE_OMEGA_GATE = args.use_omega_gate
 POLY_MODE = args.poly_mode
 POLY_DEGREE = args.poly_degree

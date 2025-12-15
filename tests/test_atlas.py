@@ -3421,3 +3421,163 @@ def test_atlas_lmm_multi_layer_with_features():
     prompt = x[:, :4]
     sampled = model.sample(prompt, 8, temperature=0., show_progress=False)
     assert sampled.shape == (2, 4)
+
+
+# ============================================================================
+# Neural Memory forward_store_only edge case tests (TDD for sample() bug fix)
+# ============================================================================
+
+def test_neural_memory_forward_store_only_return_surprises_false():
+    """Test forward_store_only works correctly when return_surprises=False.
+    
+    This tests the fix for a bug where surprises were always computed
+    even when return_surprises=False, causing shape mismatches during sample().
+    """
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        heads = 1,
+    )
+    
+    seq = torch.randn(2, 16, 16)  # batch=2, seq_len=16
+    
+    # Test with return_surprises=False (used during sample/inference)
+    new_state, surprises = mem.forward_store_only(
+        seq,
+        state=None,
+        return_surprises=False
+    )
+    
+    assert surprises is None
+    assert new_state is not None
+    assert new_state.weights is not None
+
+
+def test_neural_memory_forward_store_only_return_surprises_true():
+    """Test forward_store_only works correctly when return_surprises=True."""
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        heads = 1,
+    )
+    
+    seq = torch.randn(2, 16, 16)
+    
+    # Test with return_surprises=True (used during training)
+    new_state, surprises = mem.forward_store_only(
+        seq,
+        state=None,
+        return_surprises=True
+    )
+    
+    assert surprises is not None
+    assert len(surprises) == 2  # (unweighted_mem_model_loss, adaptive_lr)
+    assert new_state is not None
+
+
+def test_omega_neural_memory_forward_store_only():
+    """Test OmegaNeuralMemory forward_store_only with return_surprises=False."""
+    mem = OmegaNeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        heads = 1,
+        omega_window = 2,
+    )
+    
+    seq = torch.randn(2, 16, 16)
+    
+    new_state, surprises = mem.forward_store_only(
+        seq,
+        state=None,
+        return_surprises=False
+    )
+    
+    assert surprises is None
+    assert new_state is not None
+
+
+def test_neural_memory_short_sequence():
+    """Test NeuralMemory handles very short sequences (1 token).
+    
+    This simulates what happens during autoregressive sampling
+    where tokens are generated one at a time.
+    """
+    mem = NeuralMemory(
+        dim = 16,
+        chunk_size = 4,
+        heads = 1,
+    )
+    
+    # Very short sequence (1 token) - simulates sample() behavior
+    seq = torch.randn(2, 1, 16)
+    
+    # Should not raise an error
+    new_state, surprises = mem.forward_store_only(
+        seq,
+        state=None,
+        return_surprises=False
+    )
+    
+    assert new_state is not None
+    assert surprises is None
+
+
+def test_mac_transformer_sample_with_omega(monkeypatch):
+    """Test MemoryAsContextTransformer sample() with Omega variants.
+    
+    This is an integration test for the forward_store_only fix.
+    Tests the bug where sample() failed with omega/atlas variants.
+    """
+    # Use OmegaNeuralMemory for omega features
+    monkeypatch.setattr(mac, 'NeuralMemory', OmegaNeuralMemory)
+    
+    model = mac.MemoryAsContextTransformer(
+        num_tokens = 64,
+        dim = 16,
+        depth = 2,
+        segment_len = 16,
+        neural_memory_segment_len = 1,
+        num_persist_mem_tokens = 0,
+        num_longterm_mem_tokens = 0,
+        neural_memory_layers = (1,),
+        neural_memory_kwargs = dict(momentum = False, omega_window = 2),
+    )
+    
+    prompt = torch.randint(0, 64, (1, 8))
+    prompt_len = prompt.shape[-1]
+    
+    # Sample should work without errors (this previously failed)
+    # sample() returns only newly generated tokens
+    sampled = model.sample(prompt, prompt_len + 8, temperature=1.0, show_progress=False)
+    
+    assert sampled.shape == (1, 8)  # 8 new tokens
+    assert not torch.isnan(sampled.float()).any()
+
+
+@pytest.mark.parametrize('use_omega', [False, True])
+def test_mac_sample_all_variants(monkeypatch, use_omega):
+    """Test MAC sample() works for all model variants (with and without omega)."""
+    if use_omega:
+        monkeypatch.setattr(mac, 'NeuralMemory', OmegaNeuralMemory)
+        mem_kwargs = dict(momentum = False, omega_window = 2)
+    else:
+        mem_kwargs = dict(momentum = False)
+    
+    model = mac.MemoryAsContextTransformer(
+        num_tokens = 64,
+        dim = 16,
+        depth = 2,
+        segment_len = 16,
+        neural_memory_segment_len = 1,
+        num_persist_mem_tokens = 0,
+        num_longterm_mem_tokens = 0,
+        neural_memory_layers = (1,),
+        neural_memory_kwargs = mem_kwargs,
+    )
+    
+    prompt = torch.randint(0, 64, (1, 8))
+    prompt_len = prompt.shape[-1]
+    # sample() returns only newly generated tokens
+    sampled = model.sample(prompt, prompt_len + 4, temperature=1.0, show_progress=False)
+    
+    assert sampled.shape == (1, 4)  # 4 new tokens
