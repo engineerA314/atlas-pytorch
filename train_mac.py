@@ -8,8 +8,6 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from adam_atan2_pytorch import AdoptAtan2
-
 from atlas_pytorch import (
     MemoryAsContextTransformer,
     MemoryMLP,
@@ -61,16 +59,25 @@ WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 # perf related
 
-USE_ACCELERATED_SCAN = True
 USE_FLEX_ATTN = True
 USE_FAST_INFERENCE = False
 
-# wandb experiment tracker
+# wandb experiment tracker (optional)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
-import wandb
-wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
-wandb.run.name = RUN_NAME
-wandb.run.save()
+wandb_log = lambda data: None
+if args.wandb:
+    if WANDB_AVAILABLE:
+        wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
+        wandb.run.name = RUN_NAME
+        wandb.run.save()
+        wandb_log = wandb.log
+    else:
+        print("wandb not installed; skipping wandb logging.")
 
 # helpers
 
@@ -96,6 +103,27 @@ parser.add_argument('--omega-window', type=int, default=2)
 parser.add_argument('--use-omega-gate', action='store_true', default=False)
 parser.add_argument('--poly-mode', type=str, default='elementwise', choices=['off', 'elementwise', 'tensor'])
 parser.add_argument('--poly-degree', type=int, default=2)
+# device / runtime overrides
+parser.add_argument('--device', type=str, default=None, choices=['cpu', 'cuda', 'mps', 'auto'])
+parser.add_argument('--num-batches', type=int, default=NUM_BATCHES)
+parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
+parser.add_argument('--grad-accum', type=int, default=GRADIENT_ACCUMULATE_EVERY)
+parser.add_argument('--learning-rate', type=float, default=LEARNING_RATE)
+parser.add_argument('--validate-every', type=int, default=VALIDATE_EVERY)
+parser.add_argument('--generate-every', type=int, default=GENERATE_EVERY)
+parser.add_argument('--prime-length', type=int, default=PRIME_LENGTH)
+parser.add_argument('--generate-length', type=int, default=GENERATE_LENGTH)
+parser.add_argument('--should-generate', action='store_true', default=True)
+parser.add_argument('--seq-len', type=int, default=SEQ_LEN)
+parser.add_argument('--data-path', type=str, default='./data/enwik8.gz')
+# model size overrides
+parser.add_argument('--dim', type=int, default=256)
+parser.add_argument('--depth', type=int, default=2)
+parser.add_argument('--heads', type=int, default=4)
+parser.add_argument('--dim-head', type=int, default=64)
+# wandb toggle
+parser.add_argument('--wandb', action='store_true', help='Enable wandb logging if installed')
+parser.add_argument('--use-accelerated-scan', action='store_true', help='Enable accelerated assoc_scan backend when available')
 args, _ = parser.parse_known_args()
 
 MODEL_TYPE = args.model
@@ -103,6 +131,18 @@ OMEGA_WINDOW = args.omega_window
 USE_OMEGA_GATE = args.use_omega_gate
 POLY_MODE = args.poly_mode
 POLY_DEGREE = args.poly_degree
+USE_ACCELERATED_SCAN = args.use_accelerated_scan
+
+NUM_BATCHES = args.num_batches
+BATCH_SIZE = args.batch_size
+GRADIENT_ACCUMULATE_EVERY = args.grad_accum
+LEARNING_RATE = args.learning_rate
+VALIDATE_EVERY = args.validate_every
+GENERATE_EVERY = args.generate_every
+PRIME_LENGTH = args.prime_length
+GENERATE_LENGTH = args.generate_length
+SHOULD_GENERATE = args.should_generate
+SEQ_LEN = args.seq_len
 
 # memory model
 
@@ -147,10 +187,21 @@ if MODEL_TYPE in ('omeganet', 'atlas'):
         )
     )
 
+def pick_device():
+    if args.device and args.device != "auto":
+        return torch.device(args.device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+device = pick_device()
+
 model = MemoryAsContextTransformer(
     num_tokens = 256,
-    dim = 384,
-    depth = 8,
+    dim = args.dim,
+    depth = args.depth,
     segment_len = WINDOW_SIZE,
     num_persist_mem_tokens = NUM_PERSIST_MEM,
     num_longterm_mem_tokens = NUM_LONGTERM_MEM,
@@ -163,7 +214,7 @@ model = MemoryAsContextTransformer(
     sliding_window_attn = SLIDING_WINDOWS,
     neural_memory_model = neural_memory_model,
     neural_memory_kwargs = neural_memory_kwargs
-).cuda()
+).to(device)
 
 # enable Muon optimizer for Atlas by toggling flag on each memory layer
 if MODEL_TYPE == 'atlas':
@@ -174,33 +225,34 @@ if MODEL_TYPE == 'atlas':
 
 # prepare enwik8 data
 
-with gzip.open('./data/enwik8.gz') as file:
+with gzip.open(args.data_path) as file:
     data = np.frombuffer(file.read(int(95e6)), dtype = np.uint8).copy()
     data_train, data_val = np.split(data, [int(90e6)])
     data_train, data_val = map(torch.from_numpy, (data_train, data_val))
 
 class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
+    def __init__(self, data, seq_len, device):
         super().__init__()
         self.data = data
         self.seq_len = seq_len
+        self.device = device
 
     def __getitem__(self, index):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
         full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        return full_seq.to(self.device)
 
     def __len__(self):
         return self.data.size(0) // self.seq_len
 
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-val_dataset   = TextSamplerDataset(data_val, SEQ_LEN)
+train_dataset = TextSamplerDataset(data_train, SEQ_LEN, device)
+val_dataset   = TextSamplerDataset(data_val, SEQ_LEN, device)
 train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE))
 val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE))
 
 # optimizer
 
-optim = AdoptAtan2(model.parameters(), lr = LEARNING_RATE)
+optim = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
 
 # training
 
@@ -215,7 +267,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
-    wandb.log(dict(loss = loss.item()))
+    wandb_log(dict(loss = loss.item()))
 
     if i % VALIDATE_EVERY == 0:
         model.eval()

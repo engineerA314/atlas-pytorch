@@ -17,13 +17,18 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from adam_atan2_pytorch import AdoptAtan2
-
 from titans_pytorch import (
     TitansLMM,
     MemoryMLP,
     MemoryAttention
 )
+
+# CLI (minimal) - align with other scripts: accelerated scan is opt-in
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--use-accelerated-scan', action='store_true', help='Enable accelerated assoc_scan backend when available')
+parser.add_argument('--wandb', action='store_true', help='Enable wandb logging if installed')
+args, _ = parser.parse_known_args()
 
 # constants
 
@@ -57,14 +62,24 @@ WANDB_ONLINE = False
 
 # perf related
 
-USE_ACCELERATED_SCAN = True
+USE_ACCELERATED_SCAN = args.use_accelerated_scan
 
-# wandb experiment tracker
+# wandb experiment tracker (optional)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
-import wandb
-wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
-wandb.run.name = RUN_NAME
-wandb.run.save()
+wandb_log = lambda data: None
+if args.wandb:
+    if WANDB_AVAILABLE:
+        wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'online')
+        wandb.run.name = RUN_NAME
+        wandb.run.save()
+        wandb_log = wandb.log
+    else:
+        print("wandb not installed; skipping wandb logging.")
 
 # helpers
 
@@ -138,7 +153,7 @@ val_loader = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE))
 
 # optimizer
 
-optim = AdoptAtan2(model.parameters(), lr = LEARNING_RATE)
+optim = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
 
 # training
 
@@ -153,7 +168,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
-    wandb.log(dict(loss = loss.item()))
+    wandb_log(dict(loss = loss.item()))
 
     if i % VALIDATE_EVERY == 0:
         model.eval()

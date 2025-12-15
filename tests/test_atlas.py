@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import pytest
 
 from atlas_pytorch import NeuralMemory, OmegaNeuralMemory
@@ -8,6 +9,52 @@ import atlas_pytorch.mac_transformer as mac
 from atlas_pytorch.memory_models import MemoryAttention, MemorySwiGluMLP
 from atlas_pytorch.neural_memory import mem_state_detach, exists
 import types
+
+def _skip_if_no_cuda_triton():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available (integration test for triton accelerated scan)")
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        pytest.skip("triton not installed")
+    try:
+        import accelerated_scan.triton as triton_mod  # noqa
+    except Exception as e:
+        pytest.skip(f"accelerated_scan.triton import failed: {e}")
+    return triton_mod
+
+
+def test_assoc_scan_triton_backend_parity_cuda(monkeypatch):
+    """
+    Integration test: require Linux+CUDA+triton.
+    Verifies accelerated triton scan runs and matches reference assoc_scan output.
+    """
+    triton_mod = _skip_if_no_cuda_triton()
+    from assoc_scan import AssocScan
+
+    calls = {'n': 0}
+    orig_scan = triton_mod.scan
+
+    def wrapped_scan(gates, tokens):
+        calls['n'] += 1
+        return orig_scan(gates, tokens)
+
+    monkeypatch.setattr(triton_mod, 'scan', wrapped_scan)
+
+    scan_acc = AssocScan(use_accelerated=True)
+    scan_ref = AssocScan(use_accelerated=False)
+
+    torch.manual_seed(0)
+    device = torch.device('cuda')
+    B, T, D = 2, 32, 16
+    gate = torch.sigmoid(torch.randn(B, T, 1, device=device, dtype=torch.float32)).contiguous()
+    value = torch.randn(B, T, D, device=device, dtype=torch.float32).contiguous()
+
+    out_acc = scan_acc(gate, value)
+    out_ref = scan_ref(gate, value)
+
+    assert calls['n'] > 0
+    assert torch.allclose(out_acc, out_ref, atol=1e-4, rtol=1e-4)
 
 def _mem_kwargs(**extra):
     base = dict(
@@ -23,6 +70,429 @@ def _mem_kwargs(**extra):
     )
     base.update(extra)
     return base
+
+
+def test_assoc_scan_called_neural_memory(monkeypatch):
+    calls = {'n': 0}
+    class DummyScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            calls['n'] += 1
+            # simple gated cumsum
+            state = value[:, :1] if prev is None else prev.unsqueeze(1)
+            outs = []
+            for t in range(value.shape[1]):
+                state = gate[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            return torch.cat(outs, dim=1)
+
+    import atlas_pytorch.neural_memory as nm
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+    mem = NeuralMemory(**_mem_kwargs(momentum = True, chunk_size = 1, heads=1, model=torch.nn.Identity(), per_head_learned_parameters=False, batch_size=1))
+    seq = torch.randn(1, 2, 16)
+    _ = mem(seq)
+    assert calls['n'] > 0
+
+
+def test_assoc_scan_called_omega(monkeypatch):
+    calls = {'n': 0}
+    class DummyScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            calls['n'] += 1
+            state = value[:, :1] if prev is None else prev.unsqueeze(1)
+            outs = []
+            for t in range(value.shape[1]):
+                state = gate[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            return torch.cat(outs, dim=1)
+
+    import atlas_pytorch.neural_memory as nm
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+    mem = OmegaNeuralMemory(omega_window = 2, use_omega_gate = False, **_mem_kwargs(momentum = True, chunk_size = 1, heads=1, model=torch.nn.Identity(), per_head_learned_parameters=False, batch_size=1))
+    seq = torch.randn(1, 2, 16)
+    _ = mem(seq)
+    assert calls['n'] > 0
+
+
+def test_assoc_scan_accelerated_flag(monkeypatch):
+    flags = {'flag': None}
+    class DummyScan:
+        def __init__(self, use_accelerated=False, *args, **kwargs):
+            flags['flag'] = use_accelerated
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            state = value[:, :1] if prev is None else prev.unsqueeze(1)
+            outs = []
+            for t in range(value.shape[1]):
+                state = gate[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            return torch.cat(outs, dim=1)
+
+    import atlas_pytorch.neural_memory as nm
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+    _ = NeuralMemory(**_mem_kwargs(momentum=True, chunk_size=2, use_accelerated_scan=True))
+    assert flags['flag'] is True
+
+
+def test_assoc_scan_shapes_atlas_neural(monkeypatch):
+    import atlas_pytorch.neural_memory as nm
+    records = []
+
+    class RecordingScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            records.append((gate.shape, value.shape, None if prev is None else prev.shape))
+            state = value[:, :1] if prev is None else prev.unsqueeze(1)
+            g = torch.ones_like(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            return torch.cat(outs, dim=1)
+
+    monkeypatch.setattr(nm, 'AssocScan', RecordingScan)
+    mem = NeuralMemory(**_mem_kwargs(momentum=True, chunk_size=1, heads=1, model=torch.nn.Identity(), per_head_learned_parameters=False, batch_size=1))
+    seq = torch.randn(1, 3, 16)
+    _ = mem(seq)
+    assert records
+    for g, v, p in records:
+        assert g[0] == v[0] and g[1] == v[1]
+        if p is not None:
+            assert p[0] == v[0]
+
+
+@pytest.mark.parametrize('batch_size', (2,))  # must be divisible by chunk_size
+@pytest.mark.parametrize('chunk_size', (1, 2))
+@pytest.mark.parametrize('seq_len', (2, 4))
+def test_assoc_scan_shapes_atlas_neural_batched_perhead(monkeypatch, batch_size, chunk_size, seq_len):
+    import atlas_pytorch.neural_memory as nm
+    records = []
+
+    class RecordingScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            records.append((gate.shape, value.shape, None if prev is None else prev.shape))
+            state = value[:, :1] if prev is None else prev.unsqueeze(1)
+            g = torch.ones_like(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            return torch.cat(outs, dim=1)
+
+    monkeypatch.setattr(nm, 'AssocScan', RecordingScan)
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.zeros(()))
+        def forward(self, x, w=None):
+            return x
+
+    mem = NeuralMemory(
+        **_mem_kwargs(
+            momentum=True,
+            chunk_size=chunk_size,
+            heads=1,
+            per_head_learned_parameters=True,
+            model=DummyModel(),
+            mem_model_norm_add_residual=False,
+            batch_size=batch_size,
+        )
+    )
+    def fake_grad(params, inputs, loss_weights, targets):
+        key = next(iter(params.keys()))
+        w = params[key]
+        grads = {key: torch.zeros_like(w)}
+        loss = torch.zeros(inputs.shape[0], inputs.shape[1], device=inputs.device)
+        return grads, loss
+    mem.per_sample_grad_fn = fake_grad
+    seq = torch.randn(batch_size, seq_len * chunk_size, 16)
+    _ = mem(seq)
+    assert records
+    for g, v, p in records:
+        assert g[0] == v[0] and g[1] == v[1]
+        if p is not None:
+            assert p[0] == v[0]
+
+
+def test_assoc_scan_shapes_atlas_omega(monkeypatch):
+    import atlas_pytorch.neural_memory as nm
+    records = []
+
+    class RecordingScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            records.append((gate.shape, value.shape, None if prev is None else prev.shape))
+            state = value[:, :1] if prev is None else prev.unsqueeze(1)
+            g = torch.ones_like(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            return torch.cat(outs, dim=1)
+
+    monkeypatch.setattr(nm, 'AssocScan', RecordingScan)
+    mem = OmegaNeuralMemory(omega_window=3, use_omega_gate=False, **_mem_kwargs(momentum=True, chunk_size=1, heads=1, model=torch.nn.Identity(), per_head_learned_parameters=False, batch_size=1))
+    seq = torch.randn(1, 3, 16)
+    _ = mem(seq)
+    assert records
+    for g, v, p in records:
+        assert g[0] == v[0] and g[1] == v[1]
+        if p is not None:
+            assert p[0] == v[0]
+
+
+def test_assoc_scan_shapes_atlas_omega_batched(monkeypatch):
+    import atlas_pytorch.neural_memory as nm
+    records = []
+
+    class RecordingScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            records.append((gate.shape, value.shape, None if prev is None else prev.shape))
+            state = value[:, :1] if prev is None else prev.unsqueeze(1)
+            g = torch.ones_like(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            return torch.cat(outs, dim=1)
+
+    monkeypatch.setattr(nm, 'AssocScan', RecordingScan)
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.zeros(()))
+        def forward(self, x, w=None):
+            return x
+
+    mem = OmegaNeuralMemory(
+        omega_window=3,
+        use_omega_gate=False,
+        **_mem_kwargs(
+            momentum=True,
+            chunk_size=2,
+            heads=1,
+            model=DummyModel(),
+            per_head_learned_parameters=True,
+            mem_model_norm_add_residual=False,
+            batch_size=2,
+        )
+    )
+    def fake_grad(params, inputs, loss_weights, targets):
+        key = next(iter(params.keys()))
+        w = params[key]
+        grads = {key: torch.zeros_like(w)}
+        loss = torch.zeros(inputs.shape[0], inputs.shape[1], device=inputs.device)
+        return grads, loss
+    mem.per_sample_grad_fn = fake_grad
+    seq = torch.randn(2, 6, 16)  # multiple of chunk_size and >= omega_window
+    _ = mem(seq)
+    assert records
+    for g, v, p in records:
+        assert g[0] == v[0] and g[1] == v[1]
+        if p is not None:
+            assert p[0] == v[0]
+
+
+def test_assoc_scan_full_forward_atlas(monkeypatch):
+    import atlas_pytorch.neural_memory as nm
+    calls = {'n': 0}
+
+    class DummyScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            calls['n'] += 1
+            state = torch.zeros_like(value[:, :1]) if prev is None else (prev if prev.ndim == value.ndim else prev.unsqueeze(1))
+            g = torch.ones_like(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            out = torch.cat(outs, dim=1)
+            if remove_prev:
+                out = out[:, 1:]
+            return out
+
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+    mem = NeuralMemory(**_mem_kwargs(momentum=True, chunk_size=1, heads=1, model=torch.nn.Identity(), per_head_learned_parameters=False, batch_size=1))
+    seq = torch.randn(1, 2, 16)
+    out, _ = mem(seq)
+    assert calls['n'] > 0
+    assert out.shape == seq.shape
+
+
+def test_assoc_scan_full_forward_atlas_per_head_norm(monkeypatch):
+    import atlas_pytorch.neural_memory as nm
+    calls = {'n': 0}
+
+    class DummyScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            calls['n'] += 1
+            state = torch.zeros_like(value[:, :1]) if prev is None else (prev if prev.ndim == value.ndim else prev.unsqueeze(1))
+            g = torch.ones_like(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            out = torch.cat(outs, dim=1)
+            if remove_prev:
+                out = out[:, 1:]
+            return out
+
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+
+    mem = NeuralMemory(
+        **_mem_kwargs(
+            dim=8,
+            momentum=True,
+            chunk_size=1,
+            heads=2,
+            per_head_learned_parameters=True,
+            mem_model_norm_add_residual=True,
+            model=torch.nn.Identity(),
+            batch_size=1,
+        )
+    )
+    seq = torch.randn(1, 1, 8)
+    out, _ = mem(seq)
+    assert calls['n'] > 0
+    assert out.shape == seq.shape
+
+
+def test_assoc_scan_full_forward_atlas_per_head_batched(monkeypatch):
+    import atlas_pytorch.neural_memory as nm
+    calls = {'n': 0}
+
+    class DummyScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            calls['n'] += 1
+            if prev is None:
+                state = torch.zeros_like(value[:, :1])
+            else:
+                state = prev if prev.ndim == value.ndim else prev.unsqueeze(1)
+            g = gate
+            while g.ndim < value.ndim:
+                g = g.unsqueeze(-1)
+            g = g.expand_as(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            out = torch.cat(outs, dim=1)
+            if remove_prev:
+                out = out[:, 1:]
+            return out
+
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+
+    class HeadSafeLinear8(torch.nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(dim, dim))
+        def forward(self, x, weight=None):
+            w = self.weight if weight is None else weight
+            if w.ndim > 2:
+                w = w.reshape(-1, w.shape[-2], w.shape[-1])[0]
+            return torch.einsum('bnd,do->bno', x, w)
+
+    mem = NeuralMemory(
+        **_mem_kwargs(
+            dim=8,
+            momentum=True,
+            chunk_size=2,
+            heads=1,
+            per_head_learned_parameters=True,
+            mem_model_norm_add_residual=False,
+            model=HeadSafeLinear8(8),
+            batch_size=2,
+        )
+    )
+    def fake_grad(params, inputs, loss_weights, targets):
+        key = next(iter(params.keys()))
+        w = params[key]
+        grads = {key: torch.zeros_like(w)}
+        loss = torch.zeros(inputs.shape[0], inputs.shape[1], device=inputs.device)
+        return grads, loss
+    mem.per_sample_grad_fn = fake_grad
+    seq = torch.randn(2, 2, 8)
+    out, _ = mem(seq)
+    assert calls['n'] > 0
+    assert out.shape == seq.shape
+
+
+def test_assoc_scan_state_accumulates_over_steps(monkeypatch):
+    import atlas_pytorch.neural_memory as nm
+    calls = {'n': 0}
+
+    class DummyScan:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, gate, value, prev=None, remove_prev=False):
+            calls['n'] += 1
+            state = torch.zeros_like(value[:, :1]) if prev is None else (prev if prev.ndim == value.ndim else prev.unsqueeze(1))
+            g = torch.ones_like(value)
+            outs = []
+            for t in range(value.shape[1]):
+                state = g[:, t:t+1] * state + value[:, t:t+1]
+                outs.append(state)
+            out = torch.cat(outs, dim=1)
+            if remove_prev:
+                out = out[:, 1:]
+            return out
+
+    monkeypatch.setattr(nm, 'AssocScan', DummyScan)
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.zeros(()))
+        def forward(self, x, w=None):
+            return x
+
+    mem = NeuralMemory(
+        **_mem_kwargs(
+            momentum=True,
+            chunk_size=1,
+            heads=1,
+            per_head_learned_parameters=False,
+            mem_model_norm_add_residual=False,
+            model=DummyModel(),
+            batch_size=None,
+        )
+    )
+
+    def fake_grad(params, inputs, loss_weights, targets):
+        key = next(iter(params.keys()))
+        w = params[key]
+        grads = {key: torch.zeros_like(w)}
+        loss = torch.zeros(inputs.shape[0], inputs.shape[1], device=inputs.device)
+        return grads, loss
+
+    mem.per_sample_grad_fn = fake_grad
+
+    seq = torch.randn(1, 3, 16)
+    state = None
+    outs = []
+    for _ in range(3):
+        out, state = mem(seq, state=state)
+        outs.append(out)
+    # final state should reflect 3 iterations
+    assert calls['n'] > 0
+    assert outs[-1].shape == seq.shape
+    # simple monotonic check: norm should grow or stay (since adds positives)
+    assert outs[-1].abs().sum() >= outs[0].abs().sum()
 
 @pytest.mark.parametrize('seq_len', (16, 32, 64))
 @pytest.mark.parametrize('heads', (1, 4))
@@ -1146,6 +1616,69 @@ def test_atlas_mag_sampling(neural_memory_layers, prompt_len):
     sampled_with_cache_2 = model.sample(prompt, prompt_len + 10, use_cache = True, temperature = 0., show_progress = False)
     assert torch.allclose(sampled_with_cache, sampled_with_cache_2)
 
+
+@pytest.mark.parametrize('arch', ('mag', 'mac', 'mal', 'lmm'))
+@pytest.mark.parametrize('num_batches', (2, 3))
+def test_small_training_multi_batches_arch(arch, num_batches):
+    """Tiny multi-batch training loop to ensure gradients remain finite."""
+    torch.manual_seed(0)
+    num_tokens = 64
+    dim = 16
+    seq_len = 12
+
+    if arch == 'mag':
+        model = MemoryAsGateTransformer(
+            num_tokens = num_tokens,
+            dim = dim,
+            depth = 1,
+            window_size = 8,
+            neural_memory_layers = (),
+            omega_window = 2,
+            use_omega_gate = False
+        )
+    elif arch == 'mac':
+        # use OmegaNeuralMemory inside MAC
+        transformer_cls = mac.MemoryAsContextTransformer
+        model = transformer_cls(
+            num_tokens = num_tokens,
+            dim = dim,
+            depth = 1,
+            segment_len = 8,
+            neural_memory_segment_len = 1,
+            num_persist_mem_tokens = 0,
+            num_longterm_mem_tokens = 0,
+            neural_memory_layers = (),
+            neural_memory_kwargs = dict(momentum = False, omega_window = 2, use_omega_gate = False)
+        )
+    elif arch == 'mal':
+        model = MemoryAsLayerTransformer(
+            num_tokens = num_tokens,
+            dim = dim,
+            depth = 1,
+            window_size = 8,
+            neural_memory_layers = (),
+            omega_window = 2,
+            use_omega_gate = False
+        )
+    else:
+        model = AtlasLMM(
+            num_tokens = num_tokens,
+            dim = dim,
+            depth = 1,
+            omega_window = 2,
+            use_omega_gate = False
+        )
+    opt = torch.optim.AdamW(model.parameters(), lr = 1e-3)
+
+    for _ in range(num_batches):
+        x = torch.randint(0, num_tokens, (2, seq_len))
+        target = torch.randint(0, num_tokens, (2, seq_len))
+        logits = model(x)
+        loss = F.cross_entropy(logits.reshape(-1, num_tokens), target.reshape(-1))
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        assert torch.isfinite(loss)
 
 def _get_mag_memory_layer(transformer, layer_idx=0):
     """Helper to get memory module from MAG layer."""
