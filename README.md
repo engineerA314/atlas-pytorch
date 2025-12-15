@@ -4,7 +4,7 @@
 
 ## Atlas - Pytorch
 
-Unofficial implementation of [Atlas](https://arxiv.org/abs/2505.23735) in Pytorch.
+Unofficial implementation of [Atlas](https://arxiv.org/abs/2505.23735) (ATLAS: Learning to Optimally Memorize the Context at Test Time) in Pytorch.
 
 ## Usage
 
