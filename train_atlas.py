@@ -83,7 +83,7 @@ parser.add_argument('--heads', type=int, default=4)
 parser.add_argument('--dim-head', type=int, default=64)
 # wandb toggle
 parser.add_argument('--wandb', action='store_true', help='Enable wandb logging if installed')
-parser.add_argument('--use-accelerated-scan', action='store_true', help='Enable accelerated assoc_scan backend when available')
+parser.add_argument('--no-accelerated-scan', action='store_true', help='Disable accelerated assoc_scan backend (triton)')
 args, _ = parser.parse_known_args()
 
 OMEGA_WINDOW = args.omega_window
@@ -101,7 +101,7 @@ PRIME_LENGTH = args.prime_length
 GENERATE_LENGTH = args.generate_length
 SHOULD_GENERATE = args.should_generate
 SEQ_LEN = args.seq_len
-USE_ACCELERATED_SCAN = args.use_accelerated_scan
+USE_ACCELERATED_SCAN = not args.no_accelerated_scan
 
 # perf related
 
@@ -142,11 +142,11 @@ def decode_tokens(tokens):
 
 if USE_MEM_ATTENTION_MODEL:
     neural_memory_model = MemoryAttention(
-        dim = 64
+        dim = args.dim_head  # must match dim_head passed to neural_memory_kwargs
     )
 else:
     neural_memory_model = MemoryMLP(
-        dim = 64,
+        dim = args.dim_head,  # must match dim_head passed to neural_memory_kwargs
         depth = NEURAL_MEMORY_DEPTH
     )
 

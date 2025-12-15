@@ -256,6 +256,10 @@ class OmegaNeuralMemory(NeuralMemory):
         next_last_update = TensorDict()
         next_last_momentum = TensorDict()
 
+        # select assoc_scan once based on first surprise tensor device (all tensors on same device)
+        first_surprise = next(iter(surprises.values()))
+        assoc_scan = self._get_assoc_scan(first_surprise)
+
         for (param_name, surprise), (_, last_update) in zip(surprises.items(), past_last_update.items()):
             base_surprise = surprise
 
@@ -264,7 +268,7 @@ class OmegaNeuralMemory(NeuralMemory):
                 momentums = []
                 last_momentum = past_last_momentum[param_name]
                 for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):
-                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum)
+                    momentum = assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum)
                     momentums.append(momentum)
                 momentums = stack(momentums)                                   # ['o (bh) n ...']
                 next_last_momentum[param_name] = momentums[:, :, -1]
@@ -312,7 +316,7 @@ class OmegaNeuralMemory(NeuralMemory):
                 zero_update = torch.zeros_like(update)
                 update = zero_update
             else:
-                update = self.assoc_scan(1. - decay_factor, update, prev = initial_prev, remove_prev = False)
+                update = assoc_scan(1. - decay_factor, update, prev = initial_prev, remove_prev = False)
                 # Muon optimizer: apply Newton-Schulz step after recurrence to preserve shapes
                 if getattr(self, 'use_muon_optimizer', False):
                     update = newtonschulz5(update)

@@ -282,7 +282,7 @@ class NeuralMemory(Module):
         post_rmsnorm = False,
         qk_rmsnorm = False,
         max_grad_norm: float | None = None,
-        use_accelerated_scan = False,
+        use_accelerated_scan = True,
         activation: Module | None = None,
         init_adaptive_step_bias = None,
         init_momentum_bias = None,
@@ -309,9 +309,10 @@ class NeuralMemory(Module):
 
         self.batch_size = batch_size
 
-        # associative scan
-
-        self.assoc_scan = AssocScan(use_accelerated = use_accelerated_scan)
+        # associative scan - keep both versions, select at forward time based on tensor device
+        self.use_accelerated_scan_preference = use_accelerated_scan
+        self.assoc_scan_accelerated = AssocScan(use_accelerated = True) if use_accelerated_scan and torch.cuda.is_available() else None
+        self.assoc_scan_cpu = AssocScan(use_accelerated = False)
 
         # key values receiving different views
 
@@ -539,6 +540,12 @@ class NeuralMemory(Module):
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
+    def _get_assoc_scan(self, tensor):
+        """Select appropriate assoc_scan based on tensor device"""
+        if tensor.is_cuda and self.assoc_scan_accelerated is not None:
+            return self.assoc_scan_accelerated
+        return self.assoc_scan_cpu
+
     @property
     def memory_model_parameter_dict(self):
         return TensorDict(dict(zip(self.memory_model_parameter_names, self.memory_model_parameters)))
@@ -754,6 +761,10 @@ class NeuralMemory(Module):
         next_last_update = TensorDict()
         next_last_momentum = TensorDict()
 
+        # select assoc_scan once based on first surprise tensor device (all tensors on same device)
+        first_surprise = next(iter(surprises.values()))
+        assoc_scan = self._get_assoc_scan(first_surprise)
+
         for (param_name, surprise), (_, last_update) in zip(surprises.items(), past_last_update.items()):
 
             update = surprise
@@ -770,7 +781,7 @@ class NeuralMemory(Module):
                 # go from first order momentum all the way to the Nth
 
                 for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):
-                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) # momentum is S / surprise in the paper
+                    momentum = assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) # momentum is S / surprise in the paper
 
                     momentums.append(momentum)
 
@@ -794,7 +805,7 @@ class NeuralMemory(Module):
 
             # use associative scan again for learned forgetting (weight decay) - eq (13)
 
-            update = self.assoc_scan(1. - decay_factor, update, prev = last_update, remove_prev = False)
+            update = assoc_scan(1. - decay_factor, update, prev = last_update, remove_prev = False)
 
             updates[param_name] = update
             next_last_update[param_name] = update[:, -1]

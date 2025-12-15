@@ -192,7 +192,7 @@ class SegmentedAttention(Module):
         sliding = False,
         accept_value_residual = False,
         attend_kwargs: dict = dict(),
-        use_flex_attn = False
+        use_flex_attn = True
     ):
         super().__init__()
         self.norm = nn.RMSNorm(dim)
@@ -403,7 +403,10 @@ class SegmentedAttention(Module):
             assert seq.shape[-2] == 1
             return self.forward_inference(seq, cache, value_residual, output_gating = output_gating, context = context)
 
-        if seq.is_cuda and self.use_flex_attn and not disable_flex_attn:
+        # Note: flex_attention with dynamic context_len has compatibility issues with torch.compile.
+        # Fall back to non-flex path when context is provided.
+        has_context = exists(context)
+        if seq.is_cuda and self.use_flex_attn and not disable_flex_attn and not has_context:
             return self.forward_flex(seq, value_residual, flex_attn_fn, output_gating = output_gating, cache = cache, context = context)
 
         assert not (exists(value_residual) ^ exists(self.to_learned_v_mix))
@@ -420,6 +423,16 @@ class SegmentedAttention(Module):
         # prepare context sequence aligned to segments
         if exists(context):
             context, _ = pad_and_segment_with_inverse(context, total_segment_len, fold_into_batch = False)
+
+        # also pad value_residual to match padded seq length (for consistency with forward_flex path)
+        if exists(value_residual):
+            num_heads = value_residual.shape[1]
+            value_residual, _ = pad_and_segment_with_inverse(
+                rearrange(value_residual, 'b h n d -> b n (h d)'),
+                total_segment_len,
+                fold_into_batch = False
+            )
+            value_residual = rearrange(value_residual, 'b n (h d) -> b h n d', h = num_heads)
 
         # attention
 
@@ -551,7 +564,7 @@ class MemoryAsContextTransformer(Module):
         neural_memory_model: Module | None = None,
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
-        use_flex_attn = False,
+        use_flex_attn = True,
         sliding_window_attn = False,
         neural_mem_weight_residual = False,
         token_emb: Module | None = None,

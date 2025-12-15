@@ -59,7 +59,7 @@ WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 # perf related
 
-USE_FLEX_ATTN = False  # will be overridden after argparse
+USE_FLEX_ATTN = True  # will be overridden after argparse (default: enabled for L4 GPU)
 USE_FAST_INFERENCE = False
 
 # helpers
@@ -106,7 +106,7 @@ parser.add_argument('--heads', type=int, default=4)
 parser.add_argument('--dim-head', type=int, default=64)
 # wandb toggle
 parser.add_argument('--wandb', action='store_true', help='Enable wandb logging if installed')
-parser.add_argument('--use-accelerated-scan', action='store_true', help='Enable accelerated assoc_scan backend when available')
+parser.add_argument('--no-accelerated-scan', action='store_true', help='Disable accelerated assoc_scan backend (triton)')
 parser.add_argument('--no-flex-attn', action='store_true', help='Disable flex attention (for environments without triton support)')
 args, _ = parser.parse_known_args()
 
@@ -133,7 +133,7 @@ USE_FLEX_ATTN = not args.no_flex_attn
 USE_OMEGA_GATE = args.use_omega_gate
 POLY_MODE = args.poly_mode
 POLY_DEGREE = args.poly_degree
-USE_ACCELERATED_SCAN = args.use_accelerated_scan
+USE_ACCELERATED_SCAN = not args.no_accelerated_scan
 
 NUM_BATCHES = args.num_batches
 BATCH_SIZE = args.batch_size
@@ -150,11 +150,11 @@ SEQ_LEN = args.seq_len
 
 if USE_MEM_ATTENTION_MODEL:
     neural_memory_model = MemoryAttention(
-        dim = 64
+        dim = args.dim_head  # must match dim_head passed to neural_memory_kwargs
     )
 else:
     neural_memory_model = MemoryMLP(
-        dim = 64,
+        dim = args.dim_head,  # must match dim_head passed to neural_memory_kwargs
         depth = NEURAL_MEMORY_DEPTH
     )
 
@@ -166,8 +166,8 @@ if MODEL_TYPE in ('omeganet', 'atlas'):
 
 # base kwargs shared across variants
 neural_memory_kwargs = dict(
-    dim_head = 64,
-    heads = 4,
+    dim_head = args.dim_head,
+    heads = args.heads,
     attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
     qk_rmsnorm = NEURAL_MEM_QK_NORM,
     momentum = NEURAL_MEM_MOMENTUM,

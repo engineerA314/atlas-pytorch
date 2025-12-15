@@ -26,7 +26,7 @@ from titans_pytorch import (
 # CLI (minimal) - align with other scripts: accelerated scan is opt-in
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument('--use-accelerated-scan', action='store_true', help='Enable accelerated assoc_scan backend when available')
+parser.add_argument('--no-accelerated-scan', action='store_true', help='Disable accelerated assoc_scan backend (triton)')
 parser.add_argument('--wandb', action='store_true', help='Enable wandb logging if installed')
 args, _ = parser.parse_known_args()
 
@@ -62,7 +62,7 @@ WANDB_ONLINE = False
 
 # perf related
 
-USE_ACCELERATED_SCAN = args.use_accelerated_scan
+USE_ACCELERATED_SCAN = not args.no_accelerated_scan
 
 # wandb experiment tracker (optional)
 try:
