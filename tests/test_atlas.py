@@ -509,6 +509,7 @@ def test_assoc_scan_state_accumulates_over_steps(monkeypatch):
 @pytest.mark.parametrize('chunk_size', (1, 2, 4))
 @pytest.mark.parametrize('momentum', (False, True))
 def test_omega_e1_matches_baseline(seq_len, heads, chunk_size, momentum):
+    """Test that OmegaNeuralMemory with omega_window=1 matches baseline NeuralMemory."""
     torch.manual_seed(0)
     mem_base = NeuralMemory(**_mem_kwargs(heads = heads, chunk_size = chunk_size, momentum = momentum))
     # re-seed so initial weights match between base and omega even with extra modules
@@ -516,6 +517,8 @@ def test_omega_e1_matches_baseline(seq_len, heads, chunk_size, momentum):
     mem_omega = OmegaNeuralMemory(
         omega_window = 1,
         use_omega_gate = False,
+        poly_degree = 1,  # Disable poly features to match baseline
+        poly_mode = 'off',
         **_mem_kwargs(heads = heads, chunk_size = chunk_size, momentum = momentum)
     )
 
@@ -601,17 +604,22 @@ def test_omega_gate_zero_suppresses_updates(seq_len):
 
 @pytest.mark.parametrize('seq_len', (32,))
 def test_omega_gate_one_matches_off(seq_len):
+    """Test that omega gate=1 matches use_omega_gate=False."""
     torch.manual_seed(0)
     torch.manual_seed(0)
     base = OmegaNeuralMemory(
         omega_window = 3,
         use_omega_gate = False,
+        poly_degree = 1,  # Disable poly to ensure deterministic comparison
+        poly_mode = 'off',
         **_mem_kwargs(momentum = False, heads = 1, chunk_size = 4)
     )
     torch.manual_seed(0)
     gated = OmegaNeuralMemory(
         omega_window = 3,
         use_omega_gate = True,
+        poly_degree = 1,  # Disable poly to ensure deterministic comparison
+        poly_mode = 'off',
         **_mem_kwargs(momentum = False, heads = 1, chunk_size = 4)
     )
     with torch.no_grad():
@@ -834,10 +842,13 @@ def test_mac_with_omega_retrieve_then_store(monkeypatch):
 
 @pytest.mark.parametrize('seq_len', (32,))
 def test_poly_elementwise_degree_one_matches_baseline(seq_len):
+    """Test that poly_degree=1 with elementwise mode is identity (matches off mode)."""
     torch.manual_seed(0)
     base = OmegaNeuralMemory(
         omega_window = 2,
         use_omega_gate = False,
+        poly_degree = 1,
+        poly_mode = 'off',
         **_mem_kwargs(momentum = False, heads = 1, chunk_size = 4)
     )
     torch.manual_seed(0)

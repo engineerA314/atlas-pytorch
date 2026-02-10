@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 from itertools import zip_longest
 
 import torch
 from torch import nn, Tensor, stack
+from torch.nn import Parameter
 from torch.func import functional_call
 from einops import rearrange, repeat
 from tensordict import TensorDict
@@ -38,8 +40,9 @@ class OmegaNeuralMemory(NeuralMemory):
         *args,
         omega_window: int = 1,
         use_omega_gate: bool = True,
-        poly_degree: int = 1,
-        poly_mode: str = 'off',  # 'off' | 'elementwise' | 'tensor'
+        poly_degree: int = 2,
+        poly_mode: str = 'polysketch',  # 'off' | 'elementwise' | 'tensor' | 'polysketch'
+        poly_sketch_size: int | None = None,
         **kwargs
     ):
         # pop atlas-only kwargs before passing to base class
@@ -57,6 +60,14 @@ class OmegaNeuralMemory(NeuralMemory):
         self._omega_gate_act = nn.Sigmoid()
         # cache for tensor-mode random projections (non-trainable)
         self._poly_proj_cache = {}
+
+        # polysketch mode setup (dimension-specific lazy init via cache)
+        self._poly_sketch_size = poly_sketch_size
+        self._poly_sketch_cache = {}  # {dim: (h1, h2, s1, s2, proj, sketch_size)}
+        if poly_mode == 'polysketch':
+            # Trainable Taylor-series coefficients for degree-0/1/2 terms.
+            # Initialize to exp(.) Taylor coefficients: 1, 1, 1/2.
+            self._poly_coeff = Parameter(torch.tensor([1.0, 1.0, 0.5]))
 
         # safe query feature wrapper without parent cycles
         class _PolyQueryMap(nn.Module):
@@ -114,8 +125,75 @@ class OmegaNeuralMemory(NeuralMemory):
                 self._poly_proj_cache[proj_key] = proj_tensor
                 proj = proj_tensor
             return feats @ proj
+        if self.poly_mode == 'polysketch':
+            return self._forward_polysketch(x)
         # default safe return
         return x
+
+    def _get_polysketch_components(self, dim: int, device: torch.device):
+        """Get or create dimension-specific polysketch components."""
+        cache_key = (dim, device.type)
+        if cache_key not in self._poly_sketch_cache:
+            sketch_size = self._poly_sketch_size if self._poly_sketch_size is not None else dim
+            feat_dim = dim + sketch_size + 1
+            # Create components (non-registered to avoid state_dict issues with varying dims)
+            h1 = torch.randint(sketch_size, (dim,), dtype=torch.int64, device=device)
+            h2 = torch.randint(sketch_size, (dim,), dtype=torch.int64, device=device)
+            s1 = (torch.randint(0, 2, (dim,), dtype=torch.int8, device=device) * 2 - 1)
+            s2 = (torch.randint(0, 2, (dim,), dtype=torch.int8, device=device) * 2 - 1)
+            # Projection (non-trainable for simplicity with varying dims)
+            proj = torch.randn(feat_dim, dim, device=device, dtype=torch.float32) / math.sqrt(feat_dim)
+            self._poly_sketch_cache[cache_key] = (h1, h2, s1, s2, proj, sketch_size)
+        return self._poly_sketch_cache[cache_key]
+
+    def _count_sketch_dim(self, x: Tensor, h: Tensor, s: Tensor, sketch_size: int) -> Tensor:
+        """Count sketch for tensor approximation (dimension-aware)."""
+        d = x.shape[-1]
+        x_flat = x.reshape(-1, d)
+        h = h.to(x_flat.device)
+        s = s.to(x_flat.device)
+        if s.dtype != x_flat.dtype:
+            s = s.to(x_flat.dtype)
+        out = x_flat.new_zeros(x_flat.shape[0], sketch_size)
+        out.scatter_add_(1, h.expand(x_flat.shape[0], -1), x_flat * s)
+        return out.view(*x.shape[:-1], sketch_size)
+
+    def _forward_polysketch(self, x: Tensor) -> Tensor:
+        """
+        Polysketch feature map: φ(x) = Proj([c0, c1*x, c2*TensorSketch(x, x)])
+        Uses FFT-based tensor sketch for efficient quadratic feature approximation.
+        Supports varying input dimensions via dimension-specific caching.
+        """
+        d = x.shape[-1]
+        h1, h2, s1, s2, proj, sketch_size = self._get_polysketch_components(d, x.device)
+
+        # Count sketches
+        sketch1 = self._count_sketch_dim(x, h1, s1, sketch_size)
+        sketch2 = self._count_sketch_dim(x, h2, s2, sketch_size)
+
+        # FFT-based convolution for tensor sketch
+        if sketch1.dtype not in (torch.float32, torch.float64):
+            sketch1_f = sketch1.float()
+            sketch2_f = sketch2.float()
+        else:
+            sketch1_f = sketch1
+            sketch2_f = sketch2
+        fft1 = torch.fft.rfft(sketch1_f, n=sketch_size)
+        fft2 = torch.fft.rfft(sketch2_f, n=sketch_size)
+        sketch = torch.fft.irfft(fft1 * fft2, n=sketch_size)
+        if sketch.dtype != x.dtype:
+            sketch = sketch.to(x.dtype)
+
+        # Apply trainable coefficients
+        coeff = self._poly_coeff.to(dtype=x.dtype, device=x.device)
+        const_scaled = x.new_ones(*x.shape[:-1], 1) * coeff[0]
+        x_scaled = x * coeff[1]
+        sketch_scaled = sketch * coeff[2]
+
+        # Concatenate and project
+        feats = torch.cat([const_scaled, x_scaled, sketch_scaled], dim=-1)
+        proj = proj.to(dtype=x.dtype, device=x.device)
+        return feats @ proj
 
     def store_memories(
         self,

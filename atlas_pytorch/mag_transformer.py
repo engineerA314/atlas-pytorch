@@ -228,8 +228,8 @@ class MemoryAsGateTransformer(Module):
         # Atlas-specific kwargs
         omega_window: int = 1,
         use_omega_gate: bool = False,
-        poly_degree: int = 1,
-        poly_mode: str = 'off',
+        poly_degree: int = 2,
+        poly_mode: str = 'polysketch',
         use_muon_optimizer: bool = False,
     ):
         super().__init__()
